@@ -1,0 +1,50 @@
+[project]
+name = "vultr-dns-updater"
+version = "0.1.0"
+description = "Dynamic DNS updater for Vultr DNS service"
+requires-python = ">=3.12"
+
+dependencies = [
+    "click>=8.1.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+vultr-dns = "vultr_dns_updater.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["vultr_dns_updater*"]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vultr_dns_updater"]
