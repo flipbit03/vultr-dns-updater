@@ -1,0 +1,219 @@
+name: Release
+
+# Publishing a GitHub Release (`gh release create vX.Y.Z --generate-notes`)
+# builds the binaries, attaches them with their .sha256 and a build
+# provenance attestation, and publishes the crate. A prerelease
+# (`vX.Y.Z-rc.N`, `--prerelease`) does everything except crates.io, so the
+# pipeline can be rehearsed without publishing a crate.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Version from tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - name: Extract and check the version
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          VERSION="${TAG#v}"
+          # semver: X.Y.Z with an optional prerelease suffix (1.0.0-rc.1).
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag $TAG is not vX.Y.Z or vX.Y.Z-<prerelease>"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish to crates.io
+    needs: version
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The tree carries 0.0.0 ("built from source, not released"). The
+      # guard fails the release if the pattern ever stops matching.
+      - name: Patch the version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          sed -i "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
+          if grep -n '0\.0\.0' Cargo.toml; then
+            echo "::error::Cargo.toml still mentions 0.0.0 after patching"
+            exit 1
+          fi
+          cargo update --workspace
+          grep -n "^version" Cargo.toml
+
+      - name: Publish vultr-dns-updater
+        run: cargo publish --no-verify --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: vultr-dns_linux_x86_64
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: vultr-dns_linux_aarch64
+          - name: macOS aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            asset: vultr-dns_macos_aarch64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ring compiles a little C.
+      - name: Install musl-tools (Linux only)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-cargo-
+
+      # Same patch and guard as the publish job. Without the guard a stale
+      # pattern matches nothing and the release ships binaries reporting
+      # 0.0.0, which refuse `self update`. `sed -i''` because this job also
+      # runs on macOS.
+      - name: Patch the version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          sed -i'' -e "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
+          if grep -n '0\.0\.0' Cargo.toml; then
+            echo "::error::Cargo.toml still mentions 0.0.0 after patching"
+            exit 1
+          fi
+          cargo update --workspace
+          grep -n "^version" Cargo.toml
+
+      - name: Build binary
+        run: cargo build --locked --release --target ${{ matrix.target }} --features binary-release
+        env:
+          RUSTFLAGS: -Dwarnings
+
+      - name: Name the binary after its platform
+        run: cp target/${{ matrix.target }}/release/vultr-dns ${{ matrix.asset }}
+
+      # The property this tool exists for: no libc, nothing from the OS.
+      - name: Check the binary is static (Linux only)
+        if: contains(matrix.target, 'musl')
+        run: |
+          set -eu
+          file ${{ matrix.asset }}
+          if ! file ${{ matrix.asset }} | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::${{ matrix.asset }} is not statically linked"
+            exit 1
+          fi
+
+      # The binary must report the tag's version: `self update` checks the
+      # same thing before swapping a download in.
+      - name: Smoke test
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          OUT="$(./${{ matrix.asset }} --version)"
+          echo "$OUT"
+          if [ "$OUT" != "vultr-dns ${VERSION}" ]; then
+            echo "::error::expected 'vultr-dns ${VERSION}', got '$OUT'"
+            exit 1
+          fi
+
+      # `sha256sum -c` / `shasum -a 256 -c` format, read by install.sh and
+      # `self update`.
+      - name: Checksum
+        run: |
+          set -eu
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          else
+            shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          fi
+          cat ${{ matrix.asset }}.sha256
+
+      # Check with: gh attestation verify <file> -R flipbit03/vultr-dns-updater
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ matrix.asset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+  release:
+    name: Upload release binaries
+    needs: [publish, build]
+    # Runs after a skipped publish (prereleases) too, never after a failed one.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload binaries and checksums to the release
+        run: |
+          set -eu
+          ls -la artifacts
+          gh release upload "${{ github.event.release.tag_name }}" artifacts/vultr-dns_* --clobber -R "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
