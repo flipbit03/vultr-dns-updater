@@ -133,7 +133,7 @@ The API key comes from `--api-key`, then `VULTR_API_KEY`, then `api_key` in the 
 | 3 | `~/.vultr-dns-updater.toml` |
 | 4 | `./vultr-dns-updater.toml` |
 
-Keys: `api_key`, `ip_check_urls`, and `[[targets]]` with `domain`, `subdomain` and `ttl`. An unknown key is ignored with a warning, so a typo like `tll = 300` doesn't go unnoticed.
+Keys: `api_key`, `ip_check_urls`, and `[[targets]]` with `domain`, `subdomain` and `ttl`. An unknown key is ignored with a warning, so a typo like `tll = 300` doesn't go unnoticed. Two targets naming the same record (names are case-insensitive) are an error.
 
 ### How the public IP is found
 
@@ -153,6 +153,7 @@ The Rust version is a drop-in replacement: same commands and flags, same config 
 - `api_key` is optional in the file when `--api-key` or `VULTR_API_KEY` gives one.
 - `init-config` writes the file 0600 and its directory 0700.
 - Several A records with the same name: the first is updated, with a warning.
+- Record names match case-insensitively (`Home` finds `home`), and duplicate targets in the config are an error.
 - `get-ip` takes `-c`; `status`, `list-domains` and `list-records` take `--format json`; `usage` and `self update` are new; `--version` prints `vultr-dns X.Y.Z`.
 
 ## Contributing

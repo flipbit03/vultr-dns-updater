@@ -48,9 +48,13 @@ tests/
 
 **Drop-in output.** `update`'s lines are the Python tool's, word for word, blank lines included, because `journalctl -u vultr-dns-updater` is where they are read. `tests/cli.rs` holds a golden test for the "already up to date" run. Change a line only on purpose, and update the golden test with it. Warnings and errors go to stderr (stdout stays clean for `--format json`); colour only on a terminal and never with `NO_COLOR`.
 
+**Never `println!`.** All output goes through `output.rs`'s `outln!` / `out!` / `errln!`, which ignore write errors: `vultr-dns usage | head` exits quietly, and an `update` whose stdout goes away (a restarted journald) still finishes its DNS work. SIGPIPE stays ignored (systemd's `IgnoreSIGPIPE=yes` too); don't reset it.
+
 **One decision function.** `sync::decide` says what a target needs (create / update / up to date) from its record, the IP, the TTL and `--force`. `update` and `status` both use it, so "Needs update" means exactly what `update` would do, TTL included.
 
-**Every target, every page.** Each domain's records are listed once per run, following `meta.links.next` with `per_page=500`. A failing target prints its `Error:` line and the rest still run; the exit code is 1 if any failed.
+**Every target, every page.** Each domain's records are listed once per run, following `meta.links.next` with `per_page=500`; a cursor seen twice is an error, never a partial list (a target missing from a partial list would be created again). Writes update that cached list. A failing target prints its `Error:` line and the rest still run; the exit code is 1 if any failed.
+
+**Names are case-insensitive.** Record matching ignores ASCII case (`Home` finds `home`), and the config refuses two targets naming the same record.
 
 **No network on the timer path.** `update` never checks for updates. The cached "update available" hint is read (never fetched) by `usage` and `--help` only; `self update` is the only thing that calls GitHub.
 
@@ -58,7 +62,7 @@ tests/
 
 **TLS.** reqwest 0.12 with `rustls-tls`: rustls on `ring` with bundled webpki roots, as in tu and lineark. Nothing from the OS at runtime. Bundled roots age: run `cargo update` before a release.
 
-**The API key** is a `config::Secret`, whose `Debug` prints `***`. It never appears in a message, and `--api-key`'s env value is hidden from `--help`. Precedence: `--api-key` > `VULTR_API_KEY` > `api_key` in the file.
+**The API key** is a `config::Secret`, whose `Debug` prints `***`. It never appears in a message, and `--api-key`'s env value is hidden from `--help`. Config parse errors are built from toml's message and position only, never its `Display` (which quotes the source line, key included), and serde's `string "<value>"` is elided; `api_key` and `ttl` are read as raw TOML values so a type error can't echo them. Precedence: `--api-key` > `VULTR_API_KEY` > `api_key` in the file.
 
 **Config.** The Python file format, unchanged. `api_key` is optional in the file. Unknown keys warn (`serde_ignored`). Search order: `--config`, `$XDG_CONFIG_HOME/vultr-dns-updater/config.toml` (else `~/.config/…`), `~/.vultr-dns-updater.toml`, `./vultr-dns-updater.toml`.
 
@@ -66,7 +70,7 @@ tests/
 
 ## systemd units
 
-`service.rs` writes the same unit texts as my_infra's `rustible/playbooks/ourserver/files/vultr-dns-updater.{service.j2,timer}`. `tests/fixtures/` holds copies of those two files, and unit tests require byte-identical output. If my_infra's files change, copy them here; if these texts change, change my_infra's too.
+`service.rs` writes the same unit texts as my_infra's `rustible/playbooks/ourserver/files/vultr-dns-updater.{service.j2,timer}`. `tests/fixtures/` holds them as rendered on OURSERVER (user `cadu`, home `/home/cadu`, the binary in `~/.local/bin` as `install.sh` puts it), and unit tests require byte-identical output. If my_infra's files change, re-render them here; if these texts change, change my_infra's too.
 
 ## `vultr-dns usage` (agent entry point)
 
@@ -90,8 +94,8 @@ Tests never reach the internet: `tests/cli.rs` clears `VULTR_API_KEY`, isolates 
 ## CI/CD
 
 - `ci.yml` (push to main, PRs): fmt, clippy, doc lints, tests, release builds for the three targets (Linux x86_64/aarch64 musl, macOS aarch64), a static-link check on the Linux binaries, a `--version` smoke test.
-- `release.yml`: triggered by publishing a GitHub Release. Checks the tag is semver, patches the version (with the `0.0.0` guard), builds the three targets, checks the Linux binaries are static, smoke-tests `--version` against the tag, writes `<asset>.sha256`, attests build provenance (`actions/attest-build-provenance`), uploads binaries and checksums to the release, and publishes to crates.io with `CARGO_REGISTRY_TOKEN`. **A prerelease skips crates.io**; everything else runs.
-- `install.sh`: curl-based installer. Latest release, or `VULTR_DNS_VERSION=<tag>` (prereleases too); verifies the `.sha256` (fails without `sha256sum`/`shasum`); installs to `VULTR_DNS_INSTALL_DIR` (default `~/.local/bin`).
+- `release.yml`: triggered by publishing a GitHub Release. Checks the tag is semver, patches the version (with the `0.0.0` guard), builds the three targets, checks the Linux binaries are static, smoke-tests `--version` against the tag, writes `<asset>.sha256`, attests build provenance (`actions/attest-build-provenance`), uploads binaries and checksums to the release, and **then, last,** publishes to crates.io with `CARGO_REGISTRY_TOKEN`: a failed build never publishes a crate, and a crates.io failure never leaves a release without binaries. **A prerelease skips crates.io**; everything else runs. No `-Dwarnings` in release builds (lints are CI's job).
+- `install.sh`: curl-based installer, all inside `main()` so a truncated download runs nothing. Latest release, or `VULTR_DNS_VERSION=<tag>` (prereleases too); verifies the `.sha256` (fails without `sha256sum`/`shasum`); stages the binary in the install dir (`/tmp` may be noexec), requires `--version` to print the tag's version, then renames it into `VULTR_DNS_INSTALL_DIR` (default `~/.local/bin`).
 
 ## Releasing
 
