@@ -2,7 +2,7 @@ name: Release
 
 # Publishing a GitHub Release (`gh release create vX.Y.Z --generate-notes`)
 # builds the binaries, attaches them with their .sha256 and a build
-# provenance attestation, and publishes the crate. A prerelease
+# provenance attestation, then publishes the crate. A prerelease
 # (`vX.Y.Z-rc.N`, `--prerelease`) does everything except crates.io, so the
 # pipeline can be rehearsed without publishing a crate.
 
@@ -36,39 +36,6 @@ jobs:
             exit 1
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
-
-  publish:
-    name: Publish to crates.io
-    needs: version
-    if: ${{ !github.event.release.prerelease }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.release.tag_name }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # The tree carries 0.0.0 ("built from source, not released"). The
-      # guard fails the release if the pattern ever stops matching.
-      - name: Patch the version
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          set -eu
-          sed -i "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
-          if grep -n '0\.0\.0' Cargo.toml; then
-            echo "::error::Cargo.toml still mentions 0.0.0 after patching"
-            exit 1
-          fi
-          cargo update --workspace
-          grep -n "^version" Cargo.toml
-
-      - name: Publish vultr-dns-updater
-        run: cargo publish --no-verify --allow-dirty
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   build:
     name: Build (${{ matrix.name }})
@@ -136,10 +103,10 @@ jobs:
           cargo update --workspace
           grep -n "^version" Cargo.toml
 
+      # No RUSTFLAGS=-Dwarnings here: lints are CI's job, and a new
+      # toolchain warning must not block a release.
       - name: Build binary
         run: cargo build --locked --release --target ${{ matrix.target }} --features binary-release
-        env:
-          RUSTFLAGS: -Dwarnings
 
       - name: Name the binary after its platform
         run: cp target/${{ matrix.target }}/release/vultr-dns ${{ matrix.asset }}
@@ -197,9 +164,7 @@ jobs:
 
   release:
     name: Upload release binaries
-    needs: [publish, build]
-    # Runs after a skipped publish (prereleases) too, never after a failed one.
-    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -217,3 +182,39 @@ jobs:
           gh release upload "${{ github.event.release.tag_name }}" artifacts/vultr-dns_* --clobber -R "${{ github.repository }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish to crates.io
+    # Last, and only once the binaries are on the release: a crates.io
+    # failure can't leave a release without binaries, and a failed build
+    # can't publish a crate. Prereleases (rehearsals) skip it.
+    needs: [version, release]
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The tree carries 0.0.0 ("built from source, not released"). The
+      # guard fails the release if the pattern ever stops matching.
+      - name: Patch the version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          sed -i "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
+          if grep -n '0\.0\.0' Cargo.toml; then
+            echo "::error::Cargo.toml still mentions 0.0.0 after patching"
+            exit 1
+          fi
+          cargo update --workspace
+          grep -n "^version" Cargo.toml
+
+      - name: Publish vultr-dns-updater
+        run: cargo publish --no-verify --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
