@@ -1,0 +1,12 @@
+[Unit]
+Description=Vultr DNS Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cadu
+ExecStart=/home/cadu/.local/bin/vultr-dns update --config /home/cadu/.config/vultr-dns-updater/config.toml
+
+[Install]
+WantedBy=multi-user.target

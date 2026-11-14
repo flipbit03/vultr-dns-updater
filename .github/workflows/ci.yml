@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: lint-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        env:
+          RUSTFLAGS: -Dwarnings
+
+      - name: Doc lints
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: test-cargo-
+
+      # Offline only: Vultr and the IP services are wiremock servers.
+      - name: Run tests
+        run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - name: macOS aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ring compiles a little C.
+      - name: Install musl-tools (Linux only)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }} --features binary-release
+
+      # The property this tool exists for: no libc, nothing from the OS.
+      - name: Check the binary is static (Linux only)
+        if: contains(matrix.target, 'musl')
+        run: |
+          set -eu
+          BIN=target/${{ matrix.target }}/release/vultr-dns
+          file "$BIN"
+          if ! file "$BIN" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::$BIN is not statically linked"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: target/${{ matrix.target }}/release/vultr-dns --version

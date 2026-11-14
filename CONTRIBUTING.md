@@ -2,17 +2,24 @@
 
 ## Setup
 
+Install Rust from [rustup.rs](https://rustup.rs), then:
+
 ```bash
-git clone https://github.com/flipbit03/vultr-dns-updater.git
+git clone git@github.com:flipbit03/vultr-dns-updater.git
 cd vultr-dns-updater
-uv sync --group dev
-uv run pre-commit install
+cargo build
 ```
 
 ## Commands
 
 ```bash
-make lint       # Run linting
-make typecheck  # Run type checking
-make check      # Run all checks
+make check      # fmt --check, clippy (warnings are errors), doc lints
+make test       # unit + integration tests (offline: Vultr and the IP services are mocked)
+make install    # cargo install --path . --locked
 ```
+
+`make check && make test` is what CI runs; run both before pushing.
+
+## Pull requests
+
+Work on a branch and open a PR to `main`; CI must pass before merging. See [CLAUDE.md](CLAUDE.md) for the architecture, the conventions and how releases work.

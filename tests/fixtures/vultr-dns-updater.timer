@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Vultr DNS Updater every 30 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
