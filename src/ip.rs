@@ -50,12 +50,15 @@ pub fn parse_public(body: &str) -> Result<Ipv4Addr, String> {
 }
 
 /// False for what can't be the house's public address: private, loopback,
-/// link-local, CGNAT, unspecified, broadcast, documentation, multicast and
+/// link-local, CGNAT, unspecified, broadcast, documentation, benchmarking
+/// (198.18/15), IETF protocol assignments (192.0.0/24), multicast and
 /// reserved ranges. A captive portal shouldn't point the record at `10.x`.
 pub fn is_public(ip: Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
+    let [a, b, c, _] = ip.octets();
     let this_network = a == 0;
     let cgnat = a == 100 && (64..128).contains(&b);
+    let benchmarking = a == 198 && (b == 18 || b == 19);
+    let protocol_assignments = a == 192 && b == 0 && c == 0;
     let reserved = a >= 240;
     !(ip.is_private()
         || ip.is_loopback()
@@ -66,6 +69,8 @@ pub fn is_public(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || this_network
         || cgnat
+        || benchmarking
+        || protocol_assignments
         || reserved)
 }
 
@@ -113,12 +118,18 @@ mod tests {
             "203.0.113.9",
             "224.0.0.1",
             "240.0.0.1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "192.0.0.8",
         ] {
             let err = parse_public(ip).unwrap_err();
             assert!(err.contains("not a public IPv4"), "{ip}: {err}");
         }
         assert!(is_public(Ipv4Addr::new(100, 63, 255, 255)));
         assert!(is_public(Ipv4Addr::new(100, 128, 0, 0)));
+        assert!(is_public(Ipv4Addr::new(198, 17, 255, 255)));
+        assert!(is_public(Ipv4Addr::new(198, 20, 0, 1)));
+        assert!(is_public(Ipv4Addr::new(192, 0, 1, 1)));
     }
 
     #[test]

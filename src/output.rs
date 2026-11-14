@@ -8,6 +8,34 @@
 
 use std::io::IsTerminal;
 
+/// `println!` that ignores write errors. A closed pipe (`vultr-dns usage |
+/// head`) or a restarted journald must neither panic nor stop an `update`
+/// halfway; the work goes on and the exit code reflects the work.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// `print!` that ignores write errors (see `outln!`).
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = write!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// `eprintln!` that ignores write errors (see `outln!`).
+macro_rules! errln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
+pub(crate) use {out, outln};
+
 use colored::Colorize;
 use serde::Serialize;
 use tabled::settings::Style;
@@ -20,19 +48,19 @@ pub fn init_color() {
 }
 
 pub fn info(msg: &str) {
-    println!("{} {msg}", "Info:".bold().blue());
+    outln!("{} {msg}", "Info:".bold().blue());
 }
 
 pub fn success(msg: &str) {
-    println!("{} {msg}", "Success:".bold().green());
+    outln!("{} {msg}", "Success:".bold().green());
 }
 
 pub fn warning(msg: &str) {
-    eprintln!("{} {msg}", "Warning:".bold().yellow());
+    errln!("{} {msg}", "Warning:".bold().yellow());
 }
 
 pub fn error(msg: &str) {
-    eprintln!("{} {msg}", "Error:".bold().red());
+    errln!("{} {msg}", "Error:".bold().red());
 }
 
 /// How the read commands print their results.
@@ -51,7 +79,7 @@ pub fn table<T: Tabled>(rows: impl IntoIterator<Item = T>) -> String {
 }
 
 pub fn print_json<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
+    outln!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 

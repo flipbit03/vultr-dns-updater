@@ -6,6 +6,7 @@
 //! build runs `cargo install` again. Never runs on its own: the timer's
 //! `update` doesn't check for updates.
 
+use crate::output::outln;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -56,23 +57,23 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
         .context("could not determine the latest version")?;
 
     if !version_check::is_newer(current, &latest) {
-        println!(
+        outln!(
             "{BIN_NAME} {} is already the latest version.",
             current.green()
         );
         return Ok(());
     }
     if args.check {
-        println!(
+        outln!(
             "Update available: {} -> {}",
             current.yellow(),
             latest.green()
         );
-        println!("Run `{BIN_NAME} self update` to upgrade.");
+        outln!("Run `{BIN_NAME} self update` to upgrade.");
         return Ok(());
     }
 
-    println!(
+    outln!(
         "Updating {BIN_NAME} {} -> {}",
         current.yellow(),
         latest.green()
@@ -87,15 +88,33 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
 async fn update_binary(version: &str) -> Result<()> {
     let exe = std::env::current_exe().context("could not determine the current executable")?;
     let exe = exe.canonicalize().unwrap_or(exe);
+    let url = version_check::release_asset_url(version)?;
+    let old = download_and_install(&exe, &url, version).await?;
+    outln!(
+        "{BIN_NAME} {} installed to {}",
+        version.green(),
+        exe.display()
+    );
+    outln!(
+        "The previous binary is kept at {} (to roll back: mv {} {})",
+        old.display(),
+        old.display(),
+        exe.display()
+    );
+    Ok(())
+}
+
+/// Checks `exe`'s directory is writable, downloads `url` and `url.sha256`,
+/// then `install_verified`. Returns the path of the `.old` copy.
+async fn download_and_install(exe: &Path, url: &str, version: &str) -> Result<PathBuf> {
     let dir = exe
         .parent()
         .context("the current executable has no parent directory")?;
     check_writable(dir)?;
 
-    let url = version_check::release_asset_url(version)?;
-    println!("Downloading {url}");
+    outln!("Downloading {url}");
     let client = crate::http::download_client();
-    let bytes = download(&client, &url)
+    let bytes = download(&client, url)
         .await
         .context("failed to download the release binary")?;
     let sidecar_url = format!("{url}.sha256");
@@ -103,20 +122,7 @@ async fn update_binary(version: &str) -> Result<()> {
         format!("failed to download {sidecar_url}; not installing an unverified binary")
     })?;
     let sidecar = String::from_utf8(sidecar).context("the .sha256 file isn't text")?;
-
-    let old = install_verified(&exe, &bytes, &sidecar, version)?;
-    println!(
-        "{BIN_NAME} {} installed to {}",
-        version.green(),
-        exe.display()
-    );
-    println!(
-        "The previous binary is kept at {} (to roll back: mv {} {})",
-        old.display(),
-        old.display(),
-        exe.display()
-    );
-    Ok(())
+    install_verified(exe, &bytes, &sidecar, version)
 }
 
 async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
@@ -142,7 +148,7 @@ fn update_cargo() -> Result<()> {
         );
     }
 
-    println!("Running `cargo install vultr-dns-updater --locked`...");
+    outln!("Running `cargo install vultr-dns-updater --locked`...");
     let status = std::process::Command::new("cargo")
         .args(["install", "vultr-dns-updater", "--locked"])
         .status()
@@ -150,7 +156,7 @@ fn update_cargo() -> Result<()> {
     if !status.success() {
         bail!("`cargo install vultr-dns-updater --locked` exited with {status}");
     }
-    println!("{}", "Update complete.".green());
+    outln!("{}", "Update complete.".green());
     Ok(())
 }
 
@@ -235,10 +241,12 @@ fn install_verified(exe: &Path, bytes: &[u8], sidecar: &str, version: &str) -> R
     let mut tmp = TempFile(Some(tmp_path.clone()));
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // A leftover from a crashed run with the same pid goes first; then
+        // create_new, so the path can't be a planted file or symlink.
+        let _ = std::fs::remove_file(&tmp_path);
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o755)
             .open(&tmp_path)
             .with_context(|| format!("could not create {}", tmp_path.display()))?;
@@ -261,6 +269,10 @@ fn install_verified(exe: &Path, bytes: &[u8], sidecar: &str, version: &str) -> R
     std::fs::rename(&tmp_path, exe)
         .with_context(|| format!("could not replace {}", exe.display()))?;
     tmp.0 = None;
+    // Make the rename itself durable.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(old)
 }
 
@@ -383,6 +395,87 @@ mod tests {
                 leftovers(dir.path())
             );
         }
+    }
+
+    async fn serve(asset: Option<Vec<u8>>, sidecar: Option<String>) -> wiremock::MockServer {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let found = |body: Vec<u8>| ResponseTemplate::new(200).set_body_bytes(body);
+        let missing = ResponseTemplate::new(404);
+        Mock::given(path("/v9.9.9/asset"))
+            .respond_with(asset.map_or(missing.clone(), found))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v9.9.9/asset.sha256"))
+            .respond_with(sidecar.map_or(missing, |s| found(s.into_bytes())))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn download_path_installs_a_verified_binary() {
+        let (dir, exe) = setup();
+        let new = script("vultr-dns 9.9.9");
+        let server = serve(Some(new.clone()), Some(sidecar_for(&new))).await;
+        let url = format!("{}/v9.9.9/asset", server.uri());
+        let old = download_and_install(&exe, &url, "9.9.9").await.unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), new);
+        assert_eq!(std::fs::read(old).unwrap(), b"old binary");
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_path_refuses_without_a_sidecar() {
+        let (dir, exe) = setup();
+        let new = script("vultr-dns 9.9.9");
+        let server = serve(Some(new), None).await;
+        let url = format!("{}/v9.9.9/asset", server.uri());
+        let err = format!(
+            "{:#}",
+            download_and_install(&exe, &url, "9.9.9").await.unwrap_err()
+        );
+        assert!(
+            err.contains("asset.sha256; not installing an unverified binary"),
+            "{err}"
+        );
+        assert!(err.contains("404"), "{err}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old binary");
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_path_network_error_changes_nothing() {
+        let (dir, exe) = setup();
+        let err = format!(
+            "{:#}",
+            download_and_install(&exe, "http://127.0.0.1:9/v9.9.9/asset", "9.9.9")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.starts_with("failed to download the release binary: "),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old binary");
+        assert!(!dir.path().join("vultr-dns.old").exists());
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn stale_temp_file_is_replaced_not_followed() {
+        let (dir, exe) = setup();
+        let target = dir.path().join("victim");
+        std::fs::write(&target, b"keep me").unwrap();
+        let tmp = dir
+            .path()
+            .join(format!(".{BIN_NAME}.update-{}", std::process::id()));
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+        let new = script("vultr-dns 9.9.9");
+        install_verified(&exe, &new, &sidecar_for(&new), "9.9.9").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(&exe).unwrap(), new);
     }
 
     #[test]

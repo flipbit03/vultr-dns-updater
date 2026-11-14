@@ -59,7 +59,14 @@ impl Client {
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let base = Url::parse(&base).with_context(|| format!("invalid Vultr API URL {base}"))?;
+        Self::with_base(key, &base)
+    }
+
+    pub(crate) fn with_base(key: Secret, base: &str) -> Result<Self> {
+        let base = Url::parse(base)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https") && !u.cannot_be_a_base())
+            .with_context(|| format!("invalid Vultr API URL {base}"))?;
         Ok(Self {
             http: crate::http::api_client(),
             base,
@@ -71,7 +78,7 @@ impl Client {
     fn url(&self, segments: &[&str]) -> Url {
         let mut url = self.base.clone();
         url.path_segments_mut()
-            .expect("the API base URL can't be a base")
+            .expect("Client::new only accepts http(s) base URLs")
             .pop_if_empty()
             .extend(segments);
         url
@@ -115,8 +122,11 @@ impl Client {
                 .with_context(|| format!("unexpected response from Vultr ({url})"))?;
             items.extend(page.items);
             match page.next {
+                None => return Ok(items),
                 Some(next) if seen.insert(next.clone()) => cursor = Some(next),
-                _ => return Ok(items),
+                // Stopping here would return a partial list, and a target
+                // missing from it would be created again.
+                Some(next) => bail!("Vultr returned the page cursor {next:?} twice ({url})"),
             }
         }
         bail!("Vultr kept returning more pages after {MAX_PAGES}; giving up")
@@ -131,13 +141,15 @@ impl Client {
             .await
     }
 
+    /// Creates the A record and returns it as Vultr stored it (or as sent,
+    /// if the answer can't be read).
     pub async fn create_record(
         &self,
         domain: &str,
         name: &str,
         ip: Ipv4Addr,
         ttl: u32,
-    ) -> Result<()> {
+    ) -> Result<Record> {
         let body = serde_json::json!({
             "name": name,
             "type": "A",
@@ -146,8 +158,21 @@ impl Client {
             "priority": 0,
         });
         let url = self.url(&["domains", domain, "records"]);
-        self.send(Method::POST, url, Some(body)).await?;
-        Ok(())
+        let text = self.send(Method::POST, url, Some(body)).await?;
+        #[derive(Deserialize)]
+        struct Created {
+            record: Record,
+        }
+        Ok(serde_json::from_str::<Created>(&text)
+            .map(|c| c.record)
+            .unwrap_or_else(|_| Record {
+                id: String::new(),
+                kind: "A".into(),
+                name: name.into(),
+                data: ip.to_string(),
+                priority: 0,
+                ttl,
+            }))
     }
 
     pub async fn update_record(
@@ -244,6 +269,18 @@ mod tests {
         .unwrap();
         assert_eq!(page.next.as_deref(), Some("abc"));
         assert!(page_from::<Domain>("{}", "domains").is_err());
+    }
+
+    #[test]
+    fn bad_base_url_is_an_error() {
+        for bad in ["mailto:x@y", "not a url", "ftp://x.io", ""] {
+            let err = Client::with_base(Secret::new("k"), bad).err().unwrap();
+            assert!(
+                err.to_string().starts_with("invalid Vultr API URL"),
+                "{bad}"
+            );
+        }
+        assert!(Client::with_base(Secret::new("k"), "http://127.0.0.1:9/v2").is_ok());
     }
 
     #[test]

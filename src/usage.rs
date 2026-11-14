@@ -2,6 +2,7 @@
 //! `--help` is the detailed clap output for humans; this is "what can I do?".
 
 use crate::config::{self, DEFAULT_TTL};
+use crate::output::{out, outln};
 use crate::service::DEFAULT_INTERVAL;
 use crate::version_check;
 
@@ -10,11 +11,11 @@ pub fn run() {
     let default_config = config::default_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/vultr-dns-updater/config.toml".to_string());
-    print!("{}", body(version, &default_config));
-    print!("{}", config_footer(config::find().as_deref()));
+    out!("{}", body(version, &default_config));
+    out!("{}", config_footer(config::find().as_deref()));
     if let Some(hint) = version_check::cached_update_hint() {
-        println!();
-        println!("{hint}");
+        outln!();
+        outln!("{hint}");
     }
 }
 

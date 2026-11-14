@@ -2,8 +2,9 @@
 //! service and timer that run `vultr-dns update` as the installing user.
 //!
 //! The unit texts are the ones my_infra's playbook writes; a test holds them
-//! byte-identical to its files (`tests/fixtures/`).
+//! byte-identical to its files as rendered on OURSERVER (`tests/fixtures/`).
 
+use crate::output::outln;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -130,14 +131,14 @@ pub fn install(interval: u32) -> Result<()> {
         .context("could not determine the path of this executable")?;
     let (service_file, timer_file) = unit_paths();
 
-    println!();
-    println!("{}", format!("Installing {SERVICE_NAME} service...").bold());
-    println!();
-    println!("  User: {}", user.cyan());
-    println!("  Config: {}", config_path.display().to_string().cyan());
-    println!("  Executable: {}", executable.display().to_string().cyan());
-    println!("  Interval: {}", format!("{interval} minutes").cyan());
-    println!();
+    outln!();
+    outln!("{}", format!("Installing {SERVICE_NAME} service...").bold());
+    outln!();
+    outln!("  User: {}", user.cyan());
+    outln!("  Config: {}", config_path.display().to_string().cyan());
+    outln!("  Executable: {}", executable.display().to_string().cyan());
+    outln!("  Interval: {}", format!("{interval} minutes").cyan());
+    outln!();
 
     let temp_service = temp_unit(
         &format!("{SERVICE_NAME}.service"),
@@ -151,52 +152,52 @@ pub fn install(interval: u32) -> Result<()> {
         }
     };
 
-    println!("{}", "sudo password may be required...".dimmed());
-    println!();
+    outln!("{}", "sudo password may be required...".dimmed());
+    outln!();
 
     if !install_unit(&temp_service, &service_file)? {
         let _ = std::fs::remove_file(&temp_timer);
         bail!("Failed to install service file. Is sudo available?");
     }
-    println!("  Created: {}", service_file.display());
+    outln!("  Created: {}", service_file.display());
 
     if !install_unit(&temp_timer, &timer_file)? {
         bail!("Failed to install timer file.");
     }
-    println!("  Created: {}", timer_file.display());
+    outln!("  Created: {}", timer_file.display());
 
-    println!();
-    println!("{}", "Enabling service...".bold());
-    println!();
+    outln!();
+    outln!("{}", "Enabling service...".bold());
+    outln!();
 
     sudo(&["systemctl", "daemon-reload"])?;
-    println!("  Reloaded systemd daemon");
+    outln!("  Reloaded systemd daemon");
 
     let timer = format!("{SERVICE_NAME}.timer");
     if !sudo(&["systemctl", "enable", &timer])? {
         bail!("Failed to enable timer");
     }
-    println!("  Enabled {timer}");
+    outln!("  Enabled {timer}");
 
     if !sudo(&["systemctl", "start", &timer])? {
         bail!("Failed to start timer");
     }
-    println!("  Started {timer}");
+    outln!("  Started {timer}");
 
-    println!();
+    outln!();
     output::success(&format!(
         "Service installed! DNS will update every {interval} minutes."
     ));
-    println!();
-    println!(
+    outln!();
+    outln!(
         "{}",
         format!("The service runs as user '{user}' but is managed at system level.").dimmed()
     );
-    println!(
+    outln!(
         "{}  journalctl -u {SERVICE_NAME}.service",
         "View logs:".dimmed()
     );
-    println!("{} systemctl list-timers {timer}", "Check timer:".dimmed());
+    outln!("{} systemctl list-timers {timer}", "Check timer:".dimmed());
     Ok(())
 }
 
@@ -208,42 +209,42 @@ pub fn uninstall() -> Result<()> {
     }
 
     let timer = format!("{SERVICE_NAME}.timer");
-    println!();
-    println!(
+    outln!();
+    outln!(
         "{}",
         format!("Uninstalling {SERVICE_NAME} service...").bold()
     );
-    println!();
-    println!("{}", "sudo password may be required...".dimmed());
-    println!();
+    outln!();
+    outln!("{}", "sudo password may be required...".dimmed());
+    outln!();
 
     sudo(&["systemctl", "stop", &timer])?;
-    println!("  Stopped {timer}");
+    outln!("  Stopped {timer}");
     sudo(&["systemctl", "disable", &timer])?;
-    println!("  Disabled {timer}");
+    outln!("  Disabled {timer}");
 
     for file in [&timer_file, &service_file] {
         if file.exists() {
             if !sudo(&["rm", &file.to_string_lossy()])? {
                 bail!("Failed to remove {}", file.display());
             }
-            println!("  Removed: {}", file.display());
+            outln!("  Removed: {}", file.display());
         }
     }
 
     sudo(&["systemctl", "daemon-reload"])?;
-    println!("  Reloaded systemd daemon");
+    outln!("  Reloaded systemd daemon");
 
-    println!();
+    outln!();
     output::success("Service uninstalled successfully.");
     Ok(())
 }
 
 pub fn status() -> Result<()> {
     let timer = format!("{SERVICE_NAME}.timer");
-    println!();
-    println!("{}", format!("{SERVICE_NAME} Timer Status:").bold());
-    println!();
+    outln!();
+    outln!("{}", format!("{SERVICE_NAME} Timer Status:").bold());
+    outln!();
 
     let out = systemctl_captured(&["status", &timer])?;
     if out.status.code() == Some(4) {
@@ -252,9 +253,9 @@ pub fn status() -> Result<()> {
     }
     print_output(&out);
 
-    println!();
-    println!("{}", "Scheduled Timers:".bold());
-    println!();
+    outln!();
+    outln!("{}", "Scheduled Timers:".bold());
+    outln!();
     print_output(&systemctl_captured(&["list-timers", &timer])?);
     Ok(())
 }
@@ -265,34 +266,31 @@ fn print_output(out: &Output) {
     } else {
         &out.stdout
     };
-    println!("{}", String::from_utf8_lossy(text).trim_end());
+    outln!("{}", String::from_utf8_lossy(text).trim_end());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// my_infra's `rustible/playbooks/ourserver/files/vultr-dns-updater.service.j2`,
-    /// rendered the way the playbook renders it (`user`, `home`).
-    fn rendered_playbook_service(user: &str, home: &str) -> String {
-        include_str!("../tests/fixtures/vultr-dns-updater.service.j2")
-            .replace("{{ user }}", user)
-            .replace("{{ home }}", home)
-    }
+    /// my_infra's `rustible/playbooks/ourserver/files/vultr-dns-updater.service.j2`
+    /// as the playbook renders it on OURSERVER (user `cadu`, home `/home/cadu`),
+    /// with the binary installed by install.sh in `~/.local/bin`.
+    const PLAYBOOK_SERVICE: &str = include_str!("../tests/fixtures/vultr-dns-updater.service");
 
     #[test]
     fn service_unit_matches_my_infra() {
-        let fixture = rendered_playbook_service("cadu", "/home/cadu");
-        // The fixture's ExecStart, whatever binary it points at.
-        let exec = fixture
-            .lines()
-            .find_map(|l| l.strip_prefix("ExecStart="))
-            .unwrap();
-        let (exe, rest) = exec.split_once(" update --config ").unwrap();
         assert_eq!(
-            service_unit("cadu", Path::new(exe), Path::new(rest)),
-            fixture
+            service_unit(
+                "cadu",
+                Path::new("/home/cadu/.local/bin/vultr-dns"),
+                Path::new("/home/cadu/.config/vultr-dns-updater/config.toml"),
+            ),
+            PLAYBOOK_SERVICE
         );
+        assert!(PLAYBOOK_SERVICE.contains(
+            "\nExecStart=/home/cadu/.local/bin/vultr-dns update --config /home/cadu/.config/vultr-dns-updater/config.toml\n"
+        ));
     }
 
     #[test]

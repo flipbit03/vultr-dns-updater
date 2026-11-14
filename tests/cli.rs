@@ -37,7 +37,11 @@ impl Env {
     /// The binary, isolated: temp HOME and cwd, no key from this machine,
     /// Vultr and GitHub pointed at mocks / nowhere.
     fn cmd(&self) -> Command {
-        let mut cmd = Command::cargo_bin("vultr-dns").unwrap();
+        Command::from_std(self.std_cmd())
+    }
+
+    fn std_cmd(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_vultr-dns"));
         cmd.current_dir(self.home())
             .env("HOME", self.home())
             .env("XDG_CACHE_HOME", self.home().join(".cache"))
@@ -800,4 +804,158 @@ async fn self_update_refuses_on_a_dev_build() {
     let (_, stderr, code) = run(cmd).await;
     assert_eq!(code, Some(1));
     assert!(stderr.contains("dev build (0.0.0)"), "{stderr}");
+}
+
+#[tokio::test]
+async fn malformed_api_key_never_reaches_stderr() {
+    let env = Env::new().await;
+    let secret = "SECRETKEY123abc";
+    for (i, line) in [
+        format!("api_key = {secret}"),
+        format!("api_key = \"{secret}"),
+        format!("api_key = \"{secret}\" x"),
+        format!("api_key = [\"{secret}\"]"),
+        format!("api_key = '{secret}"),
+        format!("api_key = {{ k = \"{secret}\" }}"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let cfg = env.home().join(format!("leak{i}.toml"));
+        std::fs::write(
+            &cfg,
+            format!("{line}\n[[targets]]\ndomain = \"a.com\"\nsubdomain = \"h\"\n"),
+        )
+        .unwrap();
+        for cmd_args in [&["update"][..], &["status"], &["get-ip"]] {
+            let mut cmd = env.cmd();
+            cmd.args(cmd_args).arg("-c").arg(&cfg);
+            let (stdout, stderr, code) = run(cmd).await;
+            assert_eq!(code, Some(1), "{line}: {stderr}");
+            assert!(
+                stderr.starts_with("Error: Invalid configuration in "),
+                "{line}: {stderr}"
+            );
+            assert!(!stderr.contains("SECRETKEY"), "{line}: {stderr}");
+            assert!(!stdout.contains("SECRETKEY"), "{line}: {stdout}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_targets_are_refused_before_any_call() {
+    let env = Env::new().await;
+    let cfg = env.home().join("dup.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "api_key = \"{KEY}\"\nip_check_urls = [\"{}\"]\n\
+             [[targets]]\ndomain = \"example.com\"\nsubdomain = \"home\"\n\
+             [[targets]]\ndomain = \"Example.com\"\nsubdomain = \"HOME\"\nttl = 60\n",
+            env.ip_url("/ip")
+        ),
+    )
+    .unwrap();
+    Mock::given(path_regex(".*"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&env.vultr)
+        .await;
+
+    let (stdout, stderr, code) = update(&env, &cfg, &[]).await;
+    assert_eq!(code, Some(1));
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("targets[1] and targets[0] are the same record (HOME.Example.com)"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn record_names_match_case_insensitively() {
+    let env = Env::new().await;
+    let cfg = env.config(&[("example.com", "Home", 60)]);
+    env.ip_answers("/ip", 200, IP).await;
+    env.records("example.com", json!([record("r1", "home", IP, 60)]))
+        .await;
+    env.no_writes().await;
+
+    let (stdout, stderr, code) = update(&env, &cfg, &[]).await;
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("Info:   Home.example.com is already up to date"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_cursor_is_an_error_not_a_partial_list() {
+    let env = Env::new().await;
+    let cfg = env.config(&[("example.com", "home", 60)]);
+    env.ip_answers("/ip", 200, IP).await;
+    Mock::given(method("GET"))
+        .and(path("/domains/example.com/records"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "records": [record("r1", "www", "9.9.9.9", 60)],
+            "meta": {"total": 99, "links": {"next": "same", "prev": ""}}
+        })))
+        .mount(&env.vultr)
+        .await;
+    env.no_writes().await;
+
+    let (_, stderr, code) = update(&env, &cfg, &[]).await;
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("Vultr returned the page cursor \"same\" twice"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_api_url_is_an_error_not_a_panic() {
+    let env = Env::new().await;
+    let cfg = env.config(&[("example.com", "home", 60)]);
+    for bad in ["mailto:x@y", "not a url"] {
+        let mut cmd = env.cmd();
+        cmd.env("VULTR_DNS_UPDATER_API_URL", bad)
+            .args(["update", "--ip", IP, "-c"])
+            .arg(&cfg);
+        let (_, stderr, code) = run(cmd).await;
+        assert_eq!(code, Some(1), "{stderr}");
+        assert_eq!(stderr, format!("Error: invalid Vultr API URL {bad}\n"));
+    }
+}
+
+#[tokio::test]
+async fn a_closed_stdout_is_not_a_crash() {
+    let env = Env::new().await;
+    let cfg = env.config(&[("example.com", "home", 60)]);
+    env.records("example.com", json!([record("r1", "home", "1.1.1.1", 60)]))
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/domains/example.com/records/r1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&env.vultr)
+        .await;
+    let cfg_s = cfg.to_string_lossy().into_owned();
+
+    for (args, want) in [
+        (vec!["usage"], Some(0)),
+        (vec!["--help"], Some(0)),
+        (vec!["--version"], Some(0)),
+        (vec!["show-config-example"], Some(0)),
+        (vec!["update", "--help"], Some(0)),
+        // The update still happens (the PATCH mock expects one call).
+        (vec!["update", "--ip", IP, "-c", &cfg_s], Some(0)),
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let mut cmd = env.std_cmd();
+        cmd.args(&args).stdout(writer);
+        let (_, stderr, code) = run(Command::from_std(cmd)).await;
+        assert_eq!(code, want, "{args:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("Broken pipe"), "{args:?}: {stderr}");
+    }
 }

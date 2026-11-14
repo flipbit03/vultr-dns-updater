@@ -11,6 +11,7 @@ mod usage;
 mod version_check;
 mod vultr;
 
+use crate::output::outln;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -226,7 +227,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Status(args) => run_status(args).await,
         Command::GetIp(args) => {
             let cfg = config::load_optional(args.config.as_deref())?;
-            println!("{}", detect_ip(cfg.as_ref()).await?);
+            outln!("{}", detect_ip(cfg.as_ref()).await?);
             Ok(())
         }
         Command::ListDomains(args) => run_list_domains(args).await,
@@ -234,15 +235,15 @@ async fn run(command: Command) -> Result<()> {
         Command::InitConfig { path } => {
             let path = config::init_config(path)?;
             output::success(&format!("Created example config at: {}", path.display()));
-            println!();
-            println!(
+            outln!();
+            outln!(
                 "{}",
                 colored::Colorize::dimmed("Edit the file to add your Vultr API key and targets.")
             );
             Ok(())
         }
         Command::ShowConfigExample => {
-            println!("{}", config::EXAMPLE_CONFIG);
+            outln!("{}", config::EXAMPLE_CONFIG);
             Ok(())
         }
         Command::Service { action } => match action {
@@ -311,14 +312,14 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
     };
 
     if args.dry_run {
-        println!();
-        println!(
+        outln!();
+        outln!(
             "{}",
             colored::Colorize::yellow(colored::Colorize::bold(
                 "DRY RUN MODE - No changes will be made"
             ))
         );
-        println!();
+        outln!();
     }
 
     let client = vultr::Client::new(key)?;
@@ -387,7 +388,7 @@ async fn run_list_domains(args: ListArgs) -> Result<()> {
                 domain: &d.domain,
                 created: &d.date_created,
             });
-            println!("{}", output::table(rows));
+            outln!("{}", output::table(rows));
             Ok(())
         }
     }
@@ -427,7 +428,7 @@ async fn run_list_records(args: ListRecordsArgs) -> Result<()> {
                 ttl: r.ttl,
                 priority: r.priority,
             });
-            println!("{}", output::table(rows));
+            outln!("{}", output::table(rows));
             Ok(())
         }
     }

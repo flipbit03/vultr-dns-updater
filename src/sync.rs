@@ -1,6 +1,7 @@
 //! What each target needs (`decide`, pure) and doing it: drives `update`
 //! and `status`, so "Needs update" means exactly what `update` would do.
 
+use crate::output::outln;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
@@ -31,9 +32,12 @@ pub fn decide(existing: Option<&Record>, ip: Ipv4Addr, ttl: u32, force: bool) ->
     }
 }
 
-/// The first A record named `name`, and how many there are.
+/// The first A record named `name`, and how many there are. DNS names are
+/// case-insensitive, so `Home` matches `home`.
 pub fn find_record<'a>(records: &'a [Record], name: &str) -> (Option<&'a Record>, usize) {
-    let mut matches = records.iter().filter(|r| r.kind == "A" && r.name == name);
+    let mut matches = records
+        .iter()
+        .filter(|r| r.kind.eq_ignore_ascii_case("A") && r.name.eq_ignore_ascii_case(name));
     let first = matches.next();
     let count = first.map_or(0, |_| 1 + matches.count());
     (first, count)
@@ -64,15 +68,29 @@ impl<'a> Records<'a> {
     }
 
     async fn get(&mut self, domain: &str) -> &Result<Vec<Record>, String> {
-        if !self.by_domain.contains_key(domain) {
+        let key = domain.to_ascii_lowercase();
+        if !self.by_domain.contains_key(&key) {
             let result = self
                 .client
                 .list_records(domain)
                 .await
                 .map_err(|e| format!("{e:#}"));
-            self.by_domain.insert(domain.to_string(), result);
+            self.by_domain.insert(key.clone(), result);
         }
-        &self.by_domain[domain]
+        &self.by_domain[&key]
+    }
+
+    /// Records a write, so a later target in the same run sees it.
+    fn record_written(&mut self, domain: &str, written: Record) {
+        if let Some(Ok(list)) = self.by_domain.get_mut(&domain.to_ascii_lowercase()) {
+            match list
+                .iter_mut()
+                .find(|r| !written.id.is_empty() && r.id == written.id)
+            {
+                Some(r) => *r = written,
+                None => list.push(written),
+            }
+        }
     }
 }
 
@@ -98,8 +116,8 @@ pub async fn update(
     let mut failures = 0;
     for target in targets {
         let fqdn = target.fqdn();
-        println!();
-        println!("{} {fqdn}", "Processing:".bold());
+        outln!();
+        outln!("{} {fqdn}", "Processing:".bold());
 
         let list = match records.get(&target.domain).await {
             Ok(list) => list,
@@ -112,14 +130,14 @@ pub async fn update(
         let (existing, count) = find_record(list, &target.subdomain);
         match existing {
             Some(r) => {
-                println!("  Current: {} (TTL: {})", r.data, r.ttl);
+                outln!("  Current: {} (TTL: {})", r.data, r.ttl);
                 duplicate_warning(count, target, r);
             }
-            None => println!("  Current: {}", "No record exists".dimmed()),
+            None => outln!("  Current: {}", "No record exists".dimmed()),
         }
-        let existing_id = existing.map(|r| r.id.clone());
+        let existing = existing.cloned();
 
-        let result = match decide(existing, ip, target.ttl, force) {
+        let result = match decide(existing.as_ref(), ip, target.ttl, force) {
             Action::UpToDate => {
                 output::info(&format!("  {fqdn} is already up to date"));
                 Ok(())
@@ -127,25 +145,34 @@ pub async fn update(
             Action::Update { old_ip, old_ttl } => {
                 let change = describe_change(&old_ip, old_ttl, ip, target.ttl);
                 if dry_run {
-                    println!("  {} {change}", "Would update:".yellow());
+                    outln!("  {} {change}", "Would update:".yellow());
                     Ok(())
                 } else {
-                    let id = existing_id.expect("an update has a record");
-                    client
-                        .update_record(&target.domain, &id, ip, target.ttl)
-                        .await
-                        .map(|()| output::success(&format!("  Updated {fqdn}: {change}")))
+                    let mut record = existing.expect("an update has a record");
+                    let result = client
+                        .update_record(&target.domain, &record.id, ip, target.ttl)
+                        .await;
+                    if result.is_ok() {
+                        output::success(&format!("  Updated {fqdn}: {change}"));
+                        record.data = ip.to_string();
+                        record.ttl = target.ttl;
+                        records.record_written(&target.domain, record);
+                    }
+                    result
                 }
             }
             Action::Create => {
                 if dry_run {
-                    println!("  {} {} A {ip}", "Would create:".yellow(), target.subdomain);
+                    outln!("  {} {} A {ip}", "Would create:".yellow(), target.subdomain);
                     Ok(())
                 } else {
                     client
                         .create_record(&target.domain, &target.subdomain, ip, target.ttl)
                         .await
-                        .map(|()| output::success(&format!("  Created {fqdn} -> {ip}")))
+                        .map(|created| {
+                            output::success(&format!("  Created {fqdn} -> {ip}"));
+                            records.record_written(&target.domain, created);
+                        })
                 }
             }
         };
@@ -249,8 +276,8 @@ struct StatusRow {
 
 /// The human `status` output: the IP, then one row per target.
 pub fn print_status(status: &Status) {
-    println!("{} {}", "Current Public IP:".bold(), status.ip);
-    println!();
+    outln!("{} {}", "Current Public IP:".bold(), status.ip);
+    outln!();
     let rows = status.targets.iter().map(|t| StatusRow {
         fqdn: t.fqdn.clone(),
         current: t.record.as_ref().map_or_else(
@@ -259,7 +286,7 @@ pub fn print_status(status: &Status) {
         ),
         status: t.status.label().to_string(),
     });
-    println!("{}", output::table(rows));
+    outln!("{}", output::table(rows));
 }
 
 #[cfg(test)]
@@ -328,10 +355,40 @@ mod tests {
             rec("5", "A", "", "3.3.3.3", 60),
         ];
         let (r, n) = find_record(&records, "home");
-        assert_eq!((r.map(|r| r.id.as_str()), n), (Some("3"), 2));
+        assert_eq!((r.map(|r| r.id.as_str()), n), (Some("2"), 3));
+        let (r, n) = find_record(&records, "HOME");
+        assert_eq!((r.map(|r| r.id.as_str()), n), (Some("2"), 3));
         let (r, n) = find_record(&records, "");
         assert_eq!((r.map(|r| r.id.as_str()), n), (Some("5"), 1));
         assert_eq!(find_record(&records, "work"), (None, 0));
+    }
+
+    #[test]
+    fn written_records_update_the_cache() {
+        let client =
+            Client::with_base(crate::config::Secret::new("k"), "http://127.0.0.1:9").unwrap();
+        let mut records = Records::new(&client);
+        records.by_domain.insert(
+            "example.com".into(),
+            Ok(vec![rec("1", "A", "home", "1.1.1.1", 60)]),
+        );
+        // A create on a differently-cased domain lands in the same list.
+        records.record_written("Example.COM", rec("2", "A", "work", "45.77.1.2", 60));
+        // An update replaces the record with the same id.
+        records.record_written("example.com", rec("1", "A", "home", "45.77.1.2", 300));
+        // A create whose answer couldn't be read (no id) is still added.
+        records.record_written("example.com", rec("", "A", "lab", "45.77.1.2", 60));
+        let list = records.by_domain["example.com"].as_ref().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(find_record(list, "home").0.unwrap().ttl, 300);
+        assert_eq!(find_record(list, "work"), (Some(&list[1]), 1));
+        assert!(find_record(list, "lab").0.is_some());
+        // A domain whose listing failed stays failed.
+        records
+            .by_domain
+            .insert("bad.com".into(), Err("boom".into()));
+        records.record_written("bad.com", rec("3", "A", "x", "45.77.1.2", 60));
+        assert!(records.by_domain["bad.com"].is_err());
     }
 
     #[test]

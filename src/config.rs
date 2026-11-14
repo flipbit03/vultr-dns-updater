@@ -90,6 +90,12 @@ pub struct Target {
 }
 
 impl Target {
+    /// Whether both name the same DNS record (names are case-insensitive).
+    pub fn same_record(&self, other: &Target) -> bool {
+        self.domain.eq_ignore_ascii_case(&other.domain)
+            && self.subdomain.eq_ignore_ascii_case(&other.subdomain)
+    }
+
     pub fn fqdn(&self) -> String {
         if self.subdomain.is_empty() {
             self.domain.clone()
@@ -122,7 +128,9 @@ impl Config {
 
 #[derive(Deserialize)]
 struct RawConfig {
-    api_key: Option<String>,
+    /// Any TOML value, so a malformed key can never be echoed back by a
+    /// type error; `parse` requires a string.
+    api_key: Option<toml::Value>,
     #[serde(default)]
     targets: Vec<RawTarget>,
     ip_check_urls: Option<Vec<String>>,
@@ -134,12 +142,8 @@ struct RawConfig {
 struct RawTarget {
     domain: String,
     subdomain: String,
-    #[serde(default = "default_ttl")]
-    ttl: i64,
-}
-
-fn default_ttl() -> i64 {
-    DEFAULT_TTL.into()
+    /// Any TOML value, so a bad one is reported by key name.
+    ttl: Option<toml::Value>,
 }
 
 /// `$XDG_CONFIG_HOME/vultr-dns-updater/config.toml`, else `~/.config/…`.
@@ -229,27 +233,49 @@ fn parse(text: &str, path: &Path) -> Result<(Config, Vec<String>)> {
     let raw: RawConfig = serde_ignored::deserialize(toml::Deserializer::new(text), |p| {
         unknown.push(p.to_string())
     })
-    .map_err(|e| invalid(&e.to_string().trim_end()))?;
+    .map_err(|e| invalid(&describe_toml_error(&e, text)))?;
 
-    let mut targets = Vec::with_capacity(raw.targets.len());
+    let api_key = match raw.api_key {
+        None => None,
+        Some(toml::Value::String(k)) => Some(k).filter(|k| !k.is_empty()).map(Secret::new),
+        Some(_) => return Err(invalid(&"api_key must be a string")),
+    };
+
+    let mut targets: Vec<Target> = Vec::with_capacity(raw.targets.len());
     for (i, t) in raw.targets.into_iter().enumerate() {
         if t.domain.trim().is_empty() {
             return Err(invalid(&format!("targets[{i}].domain must not be empty")));
         }
-        let ttl = u32::try_from(t.ttl)
-            .ok()
-            .filter(|&ttl| ttl > 0)
-            .ok_or_else(|| {
-                invalid(&format!(
-                    "targets[{i}].ttl must be a positive integer (got {})",
-                    t.ttl
-                ))
-            })?;
-        targets.push(Target {
+        let ttl = match &t.ttl {
+            None => DEFAULT_TTL,
+            Some(toml::Value::Integer(n)) => u32::try_from(*n)
+                .ok()
+                .filter(|&ttl| ttl > 0)
+                .ok_or_else(|| {
+                    invalid(&format!(
+                        "targets[{i}].ttl must be a positive integer (got {n})"
+                    ))
+                })?,
+            Some(_) => {
+                return Err(invalid(&format!(
+                    "targets[{i}].ttl must be a positive integer"
+                )));
+            }
+        };
+        let target = Target {
             domain: t.domain,
             subdomain: t.subdomain,
             ttl,
-        });
+        };
+        // DNS names are case-insensitive: two entries for one record would
+        // fight each other (or create it twice).
+        if let Some(j) = targets.iter().position(|o| o.same_record(&target)) {
+            return Err(invalid(&format!(
+                "targets[{i}] and targets[{j}] are the same record ({})",
+                target.fqdn()
+            )));
+        }
+        targets.push(target);
     }
 
     let ip_check_urls = raw.ip_check_urls.unwrap_or_default();
@@ -265,11 +291,53 @@ fn parse(text: &str, path: &Path) -> Result<(Config, Vec<String>)> {
     }
 
     let config = Config {
-        api_key: raw.api_key.filter(|k| !k.is_empty()).map(Secret::new),
+        api_key,
         targets,
         ip_check_urls,
     };
     Ok((config, unknown))
+}
+
+/// A TOML error as `line L, column C: <message>`. Never the quoted source
+/// line toml's `Display` adds (it could hold the API key), and with any
+/// double-quoted value in the message elided.
+fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
+    let message = elide_quoted(e.message().trim());
+    match e.span() {
+        Some(span) => {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            format!("line {line}, column {column}: {message}")
+        }
+        None => message,
+    }
+}
+
+/// Elides serde's `string "<value>"` (`invalid type: string "abc"` →
+/// `invalid type: string "…"`) and puts a multi-line message on one line.
+fn elide_quoted(s: &str) -> String {
+    const MARK: &str = "string \"";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find(MARK) {
+        out.push_str(&rest[..at + MARK.len()]);
+        out.push_str("…\"");
+        // The value is Debug-formatted: skip to the first unescaped quote.
+        let value = &rest[at + MARK.len()..];
+        let mut escaped = false;
+        let end = value
+            .char_indices()
+            .find(|&(_, c)| {
+                let close = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                close
+            })
+            .map_or(value.len(), |(i, _)| i + 1);
+        rest = &value[end..];
+    }
+    out.push_str(rest);
+    out.replace('\n', ", ")
 }
 
 /// The key to use: `--api-key` / `VULTR_API_KEY` beats the config file.
@@ -397,6 +465,64 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("ttl"), "{err}");
+    }
+
+    #[test]
+    fn malformed_api_key_never_shows_up_in_errors() {
+        for text in [
+            "api_key = SECRETKEY123\n",
+            "api_key = \"SECRETKEY123\n[[targets]]\ndomain=\"a.com\"\nsubdomain=\"h\"\n",
+            "api_key = \"SECRETKEY123\" x\n",
+            "api_key = [\"SECRETKEY123\"]\n",
+            "api_key = 'SECRETKEY123\n",
+            "api_key = \"\"\"SECRETKEY123\n",
+            "api_key = { k = \"SECRETKEY123\" }\n",
+            "api_key = \"SECRETKEY123\"\napi_key = \"SECRETKEY123\"\n",
+            "ttl = \"SECRETKEY123\"\n[[targets]]\ndomain=\"a.com\"\nsubdomain=\"h\"\nttl=\"SECRETKEY123\"\n",
+        ] {
+            let err = parse_err(text);
+            assert!(!err.contains("SECRETKEY"), "{text:?} -> {err}");
+            assert!(
+                err.starts_with("Invalid configuration in /x/config.toml: "),
+                "{err}"
+            );
+        }
+        let err = parse_err("\n\napi_key = SECRETKEY123\n");
+        assert!(err.contains("line 3, column 11"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_targets_are_rejected() {
+        let err = parse_err(
+            "[[targets]]\ndomain = \"a.com\"\nsubdomain = \"home\"\n\
+             [[targets]]\ndomain = \"b.com\"\nsubdomain = \"home\"\n\
+             [[targets]]\ndomain = \"A.com\"\nsubdomain = \"Home\"\nttl = 300\n",
+        );
+        assert!(
+            err.contains("targets[2] and targets[0] are the same record (Home.A.com)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn elides_quoted_values() {
+        assert_eq!(
+            elide_quoted("invalid type: string \"abc\", expected i64"),
+            "invalid type: string \"…\", expected i64"
+        );
+        assert_eq!(
+            elide_quoted("missing field `subdomain`"),
+            "missing field `subdomain`"
+        );
+        assert_eq!(
+            elide_quoted("invalid value: string \"a\\\"b\", expected x"),
+            "invalid value: string \"…\", expected x"
+        );
+        assert_eq!(elide_quoted("string \"open"), "string \"…\"");
+        assert_eq!(
+            elide_quoted("invalid string\nexpected `\"`, `'`"),
+            "invalid string, expected `\"`, `'`"
+        );
     }
 
     #[test]
